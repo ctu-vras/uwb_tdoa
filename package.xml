@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>uwb_tdoa</name>
+  <version>1.0.0</version>
+  <description>Driver for UWB TDoA anchors</description>
+
+  <maintainer email="brozbohu@fel.cvut.cz">Bohumil Broz</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>ros_numpy</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>tf2</build_depend>
+  <build_depend>tf2_py</build_depend>
+  <build_depend>tf2_ros</build_depend>
+  <build_depend>message_generation</build_depend>
+  <build_depend>dwm1001c_ros</build_depend>
+  <build_export_depend>geometry_msgs</build_export_depend>
+  <build_export_depend>ros_numpy</build_export_depend>
+  <build_export_depend>rospy</build_export_depend>
+  <build_export_depend>std_msgs</build_export_depend>
+  <build_export_depend>tf2</build_export_depend>
+  <build_export_depend>tf2_py</build_export_depend>
+  <build_export_depend>tf2_ros</build_export_depend>
+  <build_export_depend>dwm1001c_ros</build_export_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>ros_numpy</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2</exec_depend>
+  <exec_depend>tf2_py</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>dwm1001c_ros</exec_depend>
+
+</package>

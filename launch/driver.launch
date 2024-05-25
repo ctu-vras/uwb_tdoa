@@ -1,0 +1,6 @@
+<launch>
+    <group ns="uwb/tdoa/">
+        <rosparam command="load" file="$(find uwb_tdoa)/config/tdoa.yaml" />
+        <node name="$(anon tdoa_driver)" pkg="uwb_tdoa" type="driver.py" output="screen" required='true'/>
+    </group>
+</launch>
