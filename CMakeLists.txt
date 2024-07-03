@@ -10,7 +10,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_py
   tf2_ros
   message_generation
-  dwm1001c_ros
+  dwm1001_ros
 )
 
 add_message_files(

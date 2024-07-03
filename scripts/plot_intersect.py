@@ -5,8 +5,8 @@ import copy
 import time
 
 from uwb_tdoa.msg import TDoAAnchor, TDoAMeas
-from dwm1001c_ros.msg import UWBMeas
-from xplraoa1_ros.msg import Angles
+from dwm1001_ros.msg import UWBMeas
+from xplraoa_ros.msg import Angles
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker
 
