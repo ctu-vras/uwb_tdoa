@@ -1,0 +1,59 @@
+# Parameters for the uwb_tdoa nodes.
+# The `/**` wildcard applies to every node under any namespace, so both the
+# tdoa_driver and the tdoa_locator/plot_intersect nodes pick up what they declare.
+/**:
+  ros__parameters:
+    server:
+      address: "192.168.10.250"
+      port: 6666
+
+    master: "0000000000002000"
+    num_anchors: 3
+
+    anchors:
+      address:
+        - "0000000000002000"
+        - "0000000000002002"
+        - "0000000000002001"
+      sn:
+        - "05"
+        - "49"
+        - "17"
+      position:
+        # x, y, z per anchor (flat list)
+        - 0.29
+        - 0.165
+        - 0.135
+        - 0.29
+        - -0.165
+        - 0.135
+        - -0.37
+        - 0.0
+        - 0.135
+
+    # used by tdoa_locator / plot_intersect
+    target:
+      anchor: "da12"
+      tags:
+        - "5a84"
+        - "5722"
+        - "c4b5"
+
+    # TWR tag ids and positions (x, y, z per tag, flat list).
+    # In ROS 1 these came from the /uwb/twr namespace; set them to the real tag
+    # positions before running the locator. Placeholder zeros keep the node alive.
+    twr:
+      ids:
+        - "5a84"
+        - "5722"
+        - "c4b5"
+      positions:
+        - 0.0
+        - 0.0
+        - 0.0
+        - 0.0
+        - 0.0
+        - 0.0
+        - 0.0
+        - 0.0
+        - 0.0

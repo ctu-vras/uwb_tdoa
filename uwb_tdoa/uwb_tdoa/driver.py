@@ -1,13 +1,20 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-import rospy
 import socket
 import errno
-import numpy as np
-from uwb_tdoa.msg import TDoAMeas, TDoAAnchor
-from collections import defaultdict
-from std_msgs.msg import String
 import threading
+from collections import defaultdict
+
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
+
+from uwb_tdoa_interfaces.msg import TDoAMeas, TDoAAnchor
+from std_msgs.msg import String
 
 MAGIC = b"\x02\x01\x04\x03\x06\x05\x08\x07"
 QUEUE_SIZE = 20
@@ -37,20 +44,27 @@ class UDPPacket:
         return data
 
 
-class Driver:
+class Driver(Node):
     def __init__(self) -> None:
-        rospy.init_node("tdoa_driver")
+        super().__init__("tdoa_driver")
 
-        self.sound_pub = rospy.Publisher("/log_sound", String, queue_size=1)
-        rospy.sleep(1.0)
+        self.sound_pub = self.create_publisher(String, "/log_sound", 1)
 
-        self.ip = rospy.get_param("server/address")
-        self.port = rospy.get_param("server/port")
-        self.num_anchors = rospy.get_param("num_anchors")
-        self.master_address = rospy.get_param("master")
-        self.anchors_address = rospy.get_param("anchors/address")
-        self.anchors_sn = rospy.get_param("anchors/sn")
-        self.coords = rospy.get_param("anchors/position")
+        self.declare_parameter("server.address", Parameter.Type.STRING)
+        self.declare_parameter("server.port", Parameter.Type.INTEGER)
+        self.declare_parameter("num_anchors", Parameter.Type.INTEGER)
+        self.declare_parameter("master", Parameter.Type.STRING)
+        self.declare_parameter("anchors.address", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("anchors.sn", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("anchors.position", Parameter.Type.DOUBLE_ARRAY)
+
+        self.ip = self.get_parameter("server.address").value
+        self.port = self.get_parameter("server.port").value
+        self.num_anchors = self.get_parameter("num_anchors").value
+        self.master_address = self.get_parameter("master").value
+        self.anchors_address = list(self.get_parameter("anchors.address").value)
+        self.anchors_sn = list(self.get_parameter("anchors.sn").value)
+        self.coords = list(self.get_parameter("anchors.position").value)
 
         self.positions = {}
         self.tof = {}
@@ -80,13 +94,11 @@ class Driver:
             self.sock.bind((self.ip, self.port))
         except OSError as exc:
             if exc.errno == errno.EADDRNOTAVAIL:
-                rospy.logfatal(
+                self.get_logger().fatal(
                     "OSError: [Errno 99] Cannot assign requested address [%s]" % self.ip
                 )
-                s = String("T D O A: O S Error: Cannot assign requested address")
-                self.sound_pub.publish(s)
-                rospy.sleep(0.2)
-                rospy.signal_shutdown("Cannot open the socket")
+                self.log_sound("T D O A: O S Error: Cannot assign requested address")
+                raise RuntimeError("Cannot open the socket")
             else:
                 raise
 
@@ -95,17 +107,21 @@ class Driver:
         self.prf_mask = 0xF0
         self.br_mask = 0x0F
 
-        self.pub = rospy.Publisher("measurements", TDoAMeas, queue_size=1)
+        self.pub = self.create_publisher(TDoAMeas, "measurements", 1)
 
-        self.tim = rospy.Timer(rospy.Duration(0.01), self.send_meas)
-        self.tim2 = rospy.Timer(rospy.Duration(2.0), self.check_alive)
+        self.tim = self.create_timer(0.01, self.send_meas)
+        self.tim2 = self.create_timer(2.0, self.check_alive)
 
-        rospy.on_shutdown(self.shutdown)
+        # blocking receive loop runs in its own thread so the timers keep firing
+        self.rx_thread = threading.Thread(target=self.run, daemon=True)
+        self.rx_thread.start()
+
+    def log_sound(self, text):
+        self.sound_pub.publish(String(data=text))
 
     def shutdown(self):
-        rospy.loginfo("Quitting...")
-        self.tim.shutdown()
-        rospy.sleep(0.5)
+        self.get_logger().info("Quitting...")
+        self.tim.cancel()
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError as exc:
@@ -114,19 +130,22 @@ class Driver:
             else:
                 raise
         self.sock.close()
-        rospy.sleep(0.3)
 
     def run(self):
         """decode the UDP packet"""
-        while not rospy.is_shutdown():
+        while rclpy.ok():
             try:
                 data, addr = self.sock.recvfrom(1024)
             except socket.timeout:
-                if not rospy.is_shutdown():
-                    rospy.logerr_throttle_identical(2.0, "Communication timeout")
-                    s = String("T D O A: Communication timeout")
-                    self.sound_pub.publish(s)
+                if rclpy.ok():
+                    self.get_logger().error(
+                        "Communication timeout", throttle_duration_sec=2.0
+                    )
+                    self.log_sound("T D O A: Communication timeout")
                 continue
+            except OSError:
+                # socket closed during shutdown
+                break
             packet = UDPPacket(data)
             if not packet.set_position(MAGIC):
                 continue
@@ -207,10 +226,10 @@ class Driver:
                     an.variance = rcv_var
                 elif t[0] == 4:
                     an.type4_received = True
-                    an.rssi = rssi
-                    an.fpp = fpp
-                    an.los = mc
-                    an.temperature = temp
+                    an.rssi = float(rssi)
+                    an.fpp = float(fpp)
+                    an.los = float(mc)
+                    an.temperature = float(temp)
                 elif t[0] == 5:
                     an.type5_received = True
                     an.rtto = rtto
@@ -225,9 +244,9 @@ class Driver:
             else:
                 self.message_queue[target][id] = [an]
             self.queue_lock.release()
-            self.last_received[address] = rospy.Time.now()
+            self.last_received[address] = self.get_clock().now()
 
-    def send_meas(self, _):
+    def send_meas(self):
         """find the latest new complete measurement and publish it"""
         self.queue_lock.acquire()
         targets = self.message_queue.keys()
@@ -237,14 +256,13 @@ class Driver:
                 continue
             stamps = np.sort(np.array(keys))[::-1]
             if len(stamps) > QUEUE_SIZE:
-                rospy.logwarn_throttle(
-                    3.0,
+                self.get_logger().warn(
                     "A lot of incomplete TDoA measurements, are all anchors connected?",
+                    throttle_duration_sec=3.0,
                 )
-                s = String(
+                self.log_sound(
                     "A lot of incomplete T D O A measurements, are all anchors connected?"
                 )
-                self.sound_pub.publish(s)
                 for i in range(QUEUE_SIZE, len(stamps)):
                     self.message_queue[t].pop(stamps[i])
                 stamps = stamps[:QUEUE_SIZE]
@@ -255,7 +273,7 @@ class Driver:
                     # ready to be sent
                     if stamps[i] > self.last_send:
                         m = TDoAMeas()
-                        m.stamp = rospy.Time.now()
+                        m.stamp = self.get_clock().now().to_msg()
                         m.measurements = meas_list
                         self.pub.publish(m)
                         self.last_send = stamps[i]
@@ -272,32 +290,46 @@ class Driver:
                     self.message_queue[t].pop(k)
         self.queue_lock.release()
 
-    def check_alive(self, _):
+    def check_alive(self):
         """check if all anchors are connected and sending measurements"""
-        tim = rospy.Time.now()
+        tim = self.get_clock().now()
         for a in self.anchors_address:
             if self.last_received[a] is None:
-                rospy.logwarn_throttle_identical(
-                    3.0, "No data yet from anchor with SN %s" % self.friendly_name[a]
+                self.get_logger().warn(
+                    "No data yet from anchor with SN %s" % self.friendly_name[a],
+                    throttle_duration_sec=3.0,
                 )
-                s = String(
-                    "T D O A: No data yet from anchor with SN %s"
-                    % self.friendly_name[a]
+                self.log_sound(
+                    "T D O A: No data yet from anchor with SN %s" % self.friendly_name[a]
                 )
-                self.sound_pub.publish(s)
-            elif tim - self.last_received[a] > rospy.Duration(3.0):
-                rospy.logerr(
+            elif tim - self.last_received[a] > Duration(seconds=3.0):
+                self.get_logger().error(
                     "No data received for more than 3 seconds from anchor with SN %s"
                     % self.friendly_name[a],
                 )
-                s = String(
+                self.log_sound(
                     "T D O A: No data received for more than 3 seconds from anchor with SN %s"
                     % self.friendly_name[a]
                 )
-                self.sound_pub.publish(s)
                 self.last_send = -1
 
 
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = Driver()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 if __name__ == "__main__":
-    d = Driver()
-    d.run()
+    main()

@@ -1,29 +1,30 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # 3 TDoA anchors -> 1 anchor
 
-import rospy
 import copy
-
-from uwb_tdoa.msg import TDoAAnchor, TDoAMeas
-from dwm1001_ros.msg import UWBMeas
-from xplraoa_ros.msg import Angles
-from geometry_msgs.msg import Point
-from visualization_msgs.msg import Marker
-from std_msgs.msg import Bool, String
+import threading
+from collections import deque, defaultdict
 
 import numpy as np
 from numpy.polynomial import Polynomial
+from scipy.optimize import least_squares
+from scipy.signal import lfilter, lfilter_zi, butter
+
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.duration import Duration
+from rclpy.time import Time
+
 import tf2_ros
-import tf2_py as tf2
-import ros_numpy
-import genpy
-import threading
-from scipy.optimize import least_squares
-from scipy.signal import lfilter, lfilter_zi, butter
-from collections import deque, defaultdict
-from scipy.optimize import least_squares
-from scipy.signal import lfilter, lfilter_zi, butter
-from collections import deque
+from tf2_ros import LookupException, ExtrapolationException, ConnectivityException
+
+from uwb_tdoa_interfaces.msg import TDoAAnchor, TDoAMeas
+from dwm1001_ros_interfaces.msg import UWBMeas
+from xplraoa_ros_interfaces.msg import Angles
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker
+from std_msgs.msg import Bool, String
 
 C = 299792458
 CUTOFF = 1.5
@@ -38,6 +39,28 @@ def get_angle(Va, Vb, Vn):
     # https://stackoverflow.com/a/33920320
     return float(
         np.arctan2(np.matmul(np.cross(Va, Vb, axis=0).T, Vn), np.matmul(Va.T, Vb))
+    )
+
+
+def transform_to_matrix(transform):
+    """convert a geometry_msgs/Transform into a 4x4 homogeneous matrix"""
+    t = transform.translation
+    q = transform.rotation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.eye(4)
+    s = 2.0 / n
+    xx, yy, zz = x * x * s, y * y * s, z * z * s
+    xy, xz, yz = x * y * s, x * z * s, y * z * s
+    wx, wy, wz = w * x * s, w * y * s, w * z * s
+    return np.array(
+        [
+            [1.0 - (yy + zz), xy - wz, xz + wy, t.x],
+            [xy + wz, 1.0 - (xx + zz), yz - wx, t.y],
+            [xz - wy, yz + wx, 1.0 - (xx + yy), t.z],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
     )
 
 
@@ -99,9 +122,9 @@ class Kalman:
         return self.x, self.x_cov
 
 
-class Locator:
+class Locator(Node):
     def __init__(self) -> None:
-        rospy.init_node("tdoa_locator")
+        super().__init__("tdoa_locator")
         self.msg_lock = threading.Lock()
         self.stamps = {}
         self.vars = {}
@@ -109,13 +132,21 @@ class Locator:
 
         # tf2
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
-        rospy.sleep(0.2)
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # parameters
+        self.declare_parameter("anchors.address", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("anchors.position", Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("num_anchors", Parameter.Type.INTEGER)
+        self.declare_parameter("target.anchor", Parameter.Type.STRING)
+        self.declare_parameter("target.tags", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("twr.ids", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("twr.positions", Parameter.Type.DOUBLE_ARRAY)
 
         # TDoA config
-        self.anchors_address = rospy.get_param("uwb/tdoa/anchors/address")
-        self.coords = rospy.get_param("uwb/tdoa/anchors/position")
-        self.num_anchors = rospy.get_param("uwb/tdoa/num_anchors")
+        self.anchors_address = list(self.get_parameter("anchors.address").value)
+        self.coords = list(self.get_parameter("anchors.position").value)
+        self.num_anchors = self.get_parameter("num_anchors").value
         self.positions = {}
         self.tof = {}
         self.lp_filter = butter(3, CUTOFF, fs=10.0)
@@ -135,10 +166,10 @@ class Locator:
             self.calib[address] = Polynomial([0.0, 1.0])
 
         # TWR config
-        self.target_anchor = rospy.get_param("uwb/tdoa/target/anchor")
-        self.target_tags = rospy.get_param("uwb/tdoa/target/tags")
-        self.target_ids = rospy.get_param("uwb/twr/ids")
-        self.target_coords = rospy.get_param("uwb/twr/positions")
+        self.target_anchor = self.get_parameter("target.anchor").value
+        self.target_tags = list(self.get_parameter("target.tags").value)
+        self.target_ids = list(self.get_parameter("twr.ids").value)
+        self.target_coords = list(self.get_parameter("twr.positions").value)
         self.target_positions = {}
         self.subscribers = {}
         for i in range(len(self.target_ids)):
@@ -169,7 +200,7 @@ class Locator:
 
         # position estimation
         self.last_estimate = None
-        self.tim2 = rospy.Timer(rospy.Duration(0.1), self.get_estimate)
+        self.tim_est = self.create_timer(0.1, self.get_estimate)
 
         # estimate filtration
         self.filter = Kalman(np.array([[0], [0], [0], [0], [0], [0]]), np.eye(6), 0.1)
@@ -177,25 +208,19 @@ class Locator:
 
         # angle measurements
         self.angle_zi = lfilter_zi(self.lp_filter[0], self.lp_filter[1])
-        self.angle_pub = rospy.Publisher("uwb/tdoa/angle", Angles, queue_size=1)
+        self.angle_pub = self.create_publisher(Angles, "uwb/tdoa/angle", 1)
 
         self.anchors = list(self.positions.keys())
 
-        self.marker_pub = rospy.Publisher("heading", Marker, queue_size=1)
+        self.marker_pub = self.create_publisher(Marker, "heading", 1)
 
-        self.subs1 = rospy.Subscriber(
-            "uwb/tdoa/measurements", TDoAMeas, self.tdoa_cb, queue_size=1
+        self.subs1 = self.create_subscription(
+            TDoAMeas, "uwb/tdoa/measurements", self.tdoa_cb, 1
         )
 
-        self.tim = rospy.Timer(rospy.Duration(1.0), self.auto_calibrate)
-        self.tim2 = rospy.Timer(rospy.Duration(0.1), self.estimate_angle)
+        self.tim_calib = self.create_timer(1.0, self.auto_calibrate)
+        self.tim_angle = self.create_timer(0.1, self.estimate_angle)
         print("setup done")
-
-        rospy.on_shutdown(self.shutdown)
-
-    def shutdown(self):
-        self.tim.shutdown()
-        rospy.sleep(0.2)
 
     def get_transform(self, tf_from, tf_to, out="matrix", time=None, dur=0.1):
         """returns the latest transformation between the given frames
@@ -212,31 +237,31 @@ class Locator:
                     - only ConnectivityException is logged
         """
         if time is None:
-            tf_time = rospy.Time(0)
+            tf_time = Time()
         else:
-            if not isinstance(time, rospy.Time) and not isinstance(time, genpy.Time):
+            if not isinstance(time, Time):
                 raise TypeError("parameter time has to be ROS Time")
             tf_time = time
 
         try:
             t = self.tf_buffer.lookup_transform(
-                tf_from, tf_to, tf_time, rospy.Duration(dur)
+                tf_from, tf_to, tf_time, Duration(seconds=dur)
             )
-        except (tf2.LookupException, tf2.ExtrapolationException):
+        except (LookupException, ExtrapolationException):
             return None
-        except tf2.ConnectivityException as ex:
-            rospy.logerr(ex)
+        except ConnectivityException as ex:
+            self.get_logger().error(str(ex))
             return None
 
         # return the selected type
         if out == "matrix":
-            return ros_numpy.numpify(t.transform)
+            return transform_to_matrix(t.transform)
         elif out == "tf":
             return t
         else:
             raise ValueError("argument out should be 'matrix' or 'tf'")
 
-    def get_estimate(self, _):
+    def get_estimate(self):
         t = self.get_transform("locator", "position")
         if t is not None:
             est = np.array([t[0, 3], t[1, 3]])
@@ -274,7 +299,7 @@ class Locator:
                     self.calib_queue[id1][m.target] = deque()
                 self.calib_queue[id1][m.target].append((expected_diff, diff))
 
-    def auto_calibrate(self, _):
+    def auto_calibrate(self):
         for a in self.anchors:
             l = []
             for t in self.target_tags:
@@ -337,9 +362,9 @@ class Locator:
         else:
             return None
 
-    def estimate_angle(self, _):
+    def estimate_angle(self):
         if len(self.stamps.keys()) != self.num_anchors:
-            rospy.logwarn("No data")
+            self.get_logger().warn("No data")
             return
 
         self.msg_lock.acquire()
@@ -378,22 +403,35 @@ class Locator:
             guess = self.last_estimate
         est = self.intersectionPoint(guess, pos, d, w)
         if est is None:
-            rospy.logwarn("No solution")
+            self.get_logger().warn("No solution")
         else:
             Va = np.array([[1.0], [0.0], [0.0]])
             Vb = np.array([[est[0]], [est[1]], [0.0]])
             Vn = np.array([[0.0], [0.0], [1.0]])
             angle = get_angle(Va, Vb, Vn)
-            msg = Angles(angle, 0.0, 0.0)
+            msg = Angles(azimuth=float(angle), elevation=0.0, rssi=0.0)
             self.angle_pub.publish(msg)
-            self.marker.header.stamp = rospy.Time.now()
+            self.marker.header.stamp = self.get_clock().now().to_msg()
             self.marker.points = [
-                Point(0, 0, 0),
-                Point(2 * np.cos(angle), 2 * np.sin(angle), 0),
+                Point(x=0.0, y=0.0, z=0.0),
+                Point(x=float(2 * np.cos(angle)), y=float(2 * np.sin(angle)), z=0.0),
             ]
             self.marker_pub.publish(self.marker)
 
 
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = Locator()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
 if __name__ == "__main__":
-    l = Locator()
-    rospy.spin()
+    main()
